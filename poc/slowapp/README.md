@@ -6,20 +6,19 @@ This PoC demonstrates how a long-running `EndBlocker` (e.g., 5–30s) causes Com
 - Comet RPC `/abci_query` rides the ABCI connection and is serialized with block execution; if `EndBlocker` or `Commit` is slow, the request waits.
 - The SDK supports a distinct read-only query store via `BaseApp.SetQueryMultiStore`. Queries built from this store at the latest committed height do not wait on in-flight block execution.
 - This demo exposes:
-  - Slow path: Comet RPC `/abci_query` (stalls ~sleep)
-  - Fast path: App HTTP endpoint `/height` (uses separate query store; returns immediately)
+  - Slow path: Comet RPC `/abci_info` (stalls ~sleep)
+  - Fast path: App HTTP endpoint `/abci_info` (uses separate query store; returns immediately)
 
 ### How to run
 ```bash
 # Clean ports/state, build, and start with 10s EndBlock sleep
 ./poc/slowapp/dev.sh 10
 
-# In another terminal, slow path (Comet RPC; stalls)
-time curl -s 'http://127.0.0.1:26657/abci_query?path="/store/main/key"&data=0x686569676874&height=0' \
-  | jq -r '.result.response.value' | base64 --decode
+# In another terminal, slow path (Comet RPC; stalls ~EndBlock sleep)
+time curl -s http://127.0.0.1:26657/abci_info | jq .
 
-# Fast path (direct app query; should be immediate)
-time curl -s http://127.0.0.1:8080/height
+# Fast path (direct app endpoint; immediate)
+time curl -s http://127.0.0.1:8080/abci_info | jq .
 ```
 
 ### Theory: why RPC stalls and how to avoid it
@@ -52,30 +51,28 @@ if err := qms.LoadLatestVersion(); err != nil {
 app.SetQueryMultiStore(qms)
 ```
 
-Direct, non-blocking query endpoint (bypasses Comet):
+Direct, non-blocking ABCI info endpoint (bypasses Comet):
 
-```startLine:216:endLine:270:poc/slowapp/main.go
-// startQueryHTTPServer exposes GET /height using CreateQueryContext(0,false)
-// which resolves to latest committed height on the query multistore
-func startQueryHTTPServer(app *baseapp.BaseApp, keyMain *storetypes.KVStoreKey, addr string) {
-    mux := http.NewServeMux()
-    mux.HandleFunc("/height", func(w http.ResponseWriter, r *http.Request) {
-        ctx, err := app.CreateQueryContext(0, false)
-        if err != nil { http.Error(w, err.Error(), http.StatusServiceUnavailable); return }
-        store := ctx.KVStore(keyMain)
-        val := store.Get([]byte("height"))
-        if val == nil { w.WriteHeader(http.StatusNoContent); return }
-        _, _ = w.Write(val)
-    })
-    srv := &http.Server{Addr: addr, Handler: mux}
-    go func() { _ = srv.ListenAndServe() }()
-}
+```startLine:300:endLine:338:poc/slowapp/main.go
+// GET /abci_info returns BaseApp.Info() fields without going through Comet
+mux.HandleFunc("/abci_info", func(w http.ResponseWriter, r *http.Request) {
+    ri := &cmtabci.RequestInfo{}
+    info, _ := app.Info(ri)
+    resp := map[string]any{
+        "last_block_height":    info.LastBlockHeight,
+        "last_block_app_hash":  hex.EncodeToString(info.LastBlockAppHash),
+        "version":              info.Version,
+        "app_version":          info.AppVersion,
+        "application":          info.Data,
+    }
+    _ = json.NewEncoder(w).Encode(resp)
+})
 ```
 
 ### Observing the difference
 - With `EndBlocker` sleeping N seconds, you’ll see:
-  - `/abci_query ...` often takes ~N seconds
-  - `GET /height` returns immediately
+  - `GET http://127.0.0.1:26657/abci_info` often takes ~N seconds
+  - `GET http://127.0.0.1:8080/abci_info` returns immediately
 
 ### Notes
 - The query store shares the same DB as the main app store and is loaded read-only at the latest committed version.

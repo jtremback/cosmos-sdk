@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -28,6 +30,7 @@ import (
 	"cosmossdk.io/store/rootmulti"
 	storetypes "cosmossdk.io/store/types"
 
+	cmtabci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	serversdk "github.com/cosmos/cosmos-sdk/server"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -127,7 +130,7 @@ func main() {
     }
     // In-process CometBFT node setup for a single-binary demo
     // Start a lightweight HTTP server that queries app state directly (bypasses Comet)
-    go startQueryHTTPServer(app, keyMain, httpAddr)
+    go startQueryHTTPServer(app, keyMain, qms, httpAddr)
 
     if err := runInProcessComet(app, logger); err != nil {
         panic(err)
@@ -242,9 +245,24 @@ func (s *inMemoryParamStore) Set(_ context.Context, _ cmtproto.ConsensusParams) 
 // startQueryHTTPServer starts an HTTP server exposing a direct query endpoint that does not
 // go through CometBFT. It uses BaseApp's CreateQueryContext (with the separate qms) and should
 // return immediately even during EndBlock/Commit.
-func startQueryHTTPServer(app *baseapp.BaseApp, keyMain *storetypes.KVStoreKey, addr string) {
+func startQueryHTTPServer(app *baseapp.BaseApp, keyMain *storetypes.KVStoreKey, qms storetypes.CommitMultiStore, addr string) {
     mux := http.NewServeMux()
+    // readiness endpoint: 200 once at least one commit exists, 503 otherwise
+    mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+        if qms != nil {
+            _ = qms.LoadLatestVersion()
+            if qms.LatestVersion() == 0 {
+                w.WriteHeader(http.StatusServiceUnavailable)
+                return
+            }
+        }
+        w.WriteHeader(http.StatusNoContent)
+    })
     mux.HandleFunc("/height", func(w http.ResponseWriter, r *http.Request) {
+        // Refresh query multi-store view of latest commit before building query context
+        if qms != nil {
+            _ = qms.LoadLatestVersion()
+        }
         // height=0 means latest committed
         ctx, err := app.CreateQueryContext(0, false)
         if err != nil {
@@ -262,6 +280,56 @@ func startQueryHTTPServer(app *baseapp.BaseApp, keyMain *storetypes.KVStoreKey, 
             return
         }
         _, _ = w.Write(val)
+    })
+
+    // Return the SDK multistore's latest committed version and app hash (from store metadata)
+    mux.HandleFunc("/ms_latest", func(w http.ResponseWriter, r *http.Request) {
+        if qms == nil {
+            http.Error(w, "query multistore not set", http.StatusInternalServerError)
+            return
+        }
+        // Ensure we see the latest commit metadata
+        _ = qms.LoadLatestVersion()
+        cid := qms.LastCommitID()
+        resp := map[string]any{
+            "latest_version": cid.Version,
+            "app_hash":       hex.EncodeToString(cid.Hash),
+        }
+        _ = json.NewEncoder(w).Encode(resp)
+    })
+
+    // Return header info (height/time) via CreateQueryContext over latest committed state
+    mux.HandleFunc("/header", func(w http.ResponseWriter, r *http.Request) {
+        if qms != nil {
+            _ = qms.LoadLatestVersion()
+        }
+        ctx, err := app.CreateQueryContext(0, false)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusServiceUnavailable)
+            return
+        }
+        h := ctx.BlockHeader()
+        resp := map[string]any{
+            "height": h.Height,
+            "time":   h.Time,
+            "chain":  h.ChainID,
+        }
+        _ = json.NewEncoder(w).Encode(resp)
+    })
+
+    // Return BaseApp.Info() data (ABCI Info) directly without going through Comet
+    mux.HandleFunc("/abci_info", func(w http.ResponseWriter, r *http.Request) {
+        // BaseApp.Info matches CometBFT ABCI types signature
+        ri := &cmtabci.RequestInfo{}
+        info, _ := app.Info(ri)
+        resp := map[string]any{
+            "last_block_height":    info.LastBlockHeight,
+            "last_block_app_hash":  hex.EncodeToString(info.LastBlockAppHash),
+            "version":              info.Version,
+            "app_version":          info.AppVersion,
+            "application":          info.Data,
+        }
+        _ = json.NewEncoder(w).Encode(resp)
     })
     srv := &http.Server{Addr: addr, Handler: mux}
     go func() { _ = srv.ListenAndServe() }()
