@@ -22,8 +22,12 @@ time curl -s http://127.0.0.1:8080/abci_info | jq .
 ```
 
 ### Theory: why RPC stalls and how to avoid it
-- **Why stall happens:** CometBFT processes ABCI requests in order. During `FinalizeBlock` → `EndBlock` → `Commit`, Comet issues requests to the app and waits for responses before moving forward. Its own `/abci_query` RPC calls are multiplexed onto ABCI but effectively block behind those in-flight ABCI calls.
-- **SDK capability:** `BaseApp.CreateQueryContextWithCheckHeader` selects the query MultiStore `qms` if set via `SetQueryMultiStore`, otherwise the commit MultiStore `cms`. When `qms` is used, it snapshots state at the latest committed version: `qms.CacheMultiStoreWithVersion(latest)`. No writes are taken, so queries are not serialized with block writes.
+- **Why stall happens:** CometBFT processes ABCI requests in order. During `FinalizeBlock` → `EndBlock` → `Commit`, Comet issues requests to the app and waits for responses before moving forward. Its own `/abci_*` RPC calls are multiplexed onto ABCI but effectively block behind those in-flight ABCI calls.
+- **SDK capability:** `BaseApp.CreateQueryContextWithCheckHeader` selects the query MultiStore `qms` if set via `SetQueryMultiStore`, otherwise the commit MultiStore `cms`. When `qms` is used, it snapshots state at the latest committed version. No writes are taken, so queries are not serialized with block writes.
+
+### Is SetQueryMultiStore required for this demo?
+- For the fast example `GET /abci_info`: not strictly. It calls `BaseApp.Info()` directly (reads last commit metadata) and bypasses Comet entirely, so it’s already fast.
+- For general state queries (gRPC/module APIs using `CreateQueryContext`): recommended. A separate read-only query multistore ensures consistent snapshots at the latest committed height and avoids any interaction with write paths.
 
 ### Code excerpts
 
