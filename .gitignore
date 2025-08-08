@@ -38,6 +38,10 @@ x/genutil/config
 x/genutil/data
 *.fail
 
+# PoC slowapp artifacts
+/poc/slowapp/.tm/
+/bin/slowapp
+
 # Vagrant
 .vagrant/
 *.box
